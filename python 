@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""
+Sign and append a ledger entry for an audit report.
+Supports flexible schema mapping for findings and reports.
+"""
+import argparse
+import json
+import os
+import hmac
+import hashlib
+from datetime import datetime
+
+def canonical_json_bytes(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def merkle_root(items):
+    if not items:
+        return sha256_hex(b"empty-state")
+    level = [sha256_hex(canonical_json_bytes(item)) for item in items]
+    if len(level) == 1:
+        return level[0]
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])
+        new_level = []
+        for i in range(0, len(level), 2):
+            new_level.append(sha256_hex((level[i] + level[i+1]).encode("utf-8")))
+        level = new_level
+    return level[0]
+
+def read_ledger(path):
+    if not os.path.exists(path):
+        return []
+    lines = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            lines.append(json.loads(line))
+    return lines
+
+def sign_payload_hmac(payload: dict, secret: str) -> str:
+    return hmac.new(secret.encode("utf-8"), canonical_json_bytes(payload), hashlib.sha256).hexdigest()
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--report", default="oversight_summary_export.json", help="Path to structured JSON report")
+    p.add_argument("--ledger", default="ledger.jsonl", help="Ledger JSONL file to append to")
+    p.add_argument("--actor", default="crawler", help="Actor name to include in ledger entry")
+    p.add_argument("--secret", help="HMAC secret (or set AUDIT_SECRET env var)")
+    args = p.parse_args()
+
+    secret = args.secret or os.environ.get("AUDIT_SECRET")
+    if not secret:
+        raise SystemExit("Provide --secret or set AUDIT_SECRET env var")
+
+    with open(args.report, "rb") as f:
+        raw = f.read()
+    try:
+        report = json.loads(raw)
+    except Exception as e:
+        raise SystemExit(f"Failed to parse JSON report: {e}")
+
+    content_hash = sha256_hex(raw)
+
+    # Support both 'detailed_reports' and 'reports' keys
+    dr = report.get("detailed_reports") or report.get("reports") or []
+    url = "report:unknown"
+    if dr and isinstance(dr, list) and len(dr) > 0:
+        url = dr[0].get("url") or "report:unknown"
+
+    # Support both 'extracted_snippets' and 'findings' keys
+    items = []
+    for r in dr:
+        snippets = r.get("extracted_snippets") or r.get("findings") or []
+        for s in snippets:
+            cat_raw = s.get("categories") or s.get("category") or []
+            if isinstance(cat_raw, str):
+                categories = [c.strip() for c in cat_raw.split(",")]
+            elif isinstance(cat_raw, list):
+                categories = cat_raw
+            else:
+                categories = []
+
+            item = {
+                "categories": categories,
+                "text": s.get("text") or s.get("text_snippet") or s.get("snippet") or ""
+            }
+            items.append(item)
+
+    state_root = merkle_root(items)
+
+    ledger_lines = read_ledger(args.ledger)
+    previous_hash = None
+    if ledger_lines:
+        previous_hash = sha256_hex(canonical_json_bytes(ledger_lines[-1]))
+
+    payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "actor": args.actor,
+        "url": url,
+        "content_hash": content_hash,
+        "state_root": state_root,
+        "previous_hash": previous_hash
+    }
+
+    signature = sign_payload_hmac(payload, secret)
+    entry = {**payload, "signature": signature}
+
+    with open(args.ledger, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+    print("Appended ledger entry successfully:")
+    print(json.dumps(entry, indent=2, sort_keys=True))
+
+if __name__ == "__main__":
+    main()
