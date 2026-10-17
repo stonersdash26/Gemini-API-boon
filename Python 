@@ -1,3 +1,159 @@
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+from typing import List
+
+# Import cryptographic primitives
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
+@dataclass(frozen=True)
+class TransactionToken:
+    """
+    Strongly-typed, cryptographically signed token representing an atomic state action.
+    """
+    event_id: str
+    payload_hash: str
+    timestamp: str
+    public_key_bytes: bytes  # Identity of the entity executing the transition
+    signature: bytes         # Ed25519 signature proving identity signed the transition parameters
+
+class CryptographicHistoryEngine:
+    def __init__(self, genesis_message: str = "GENESIS_BLOCK_MAXIMUS_INTEGRITY"):
+        # Establish the initial immutable root anchor (H_0)
+        self.genesis_hash = hashlib.sha256(genesis_message.encode('utf-8')).hexdigest()
+        self.chain: List[str] = [self.genesis_hash]
+        self.token_ledger: List[TransactionToken] = []
+
+    def tokenize_and_append(self, event_id: str, raw_payload: dict, private_key: ed25519.Ed25519PrivateKey) -> str:
+        """
+        Tokenizes payload, extracts the public identity, signs the context,
+        and binds it tightly to the previous state history hash.
+        """
+        # 1. Normalize and hash raw input payload to enforce immutability
+        serialized_payload = json.dumps(raw_payload, sort_keys=True).encode('utf-8')
+        payload_hash = hashlib.sha256(serialized_payload).hexdigest()
+        
+        # 2. Capture an immutable timestamp anchor
+        timestamp = datetime.now(timezone.utc).isoformat()
+        
+        # 3. Extract the clean Public Key bytes to embed as the identity vector
+        public_key = private_key.public_key()
+        public_key_bytes = public_key.public_bytes_raw()
+        
+        # 4. Construct the precise bytes string that needs to be legally signed
+        # This message binds the event type, data payload, time, and prior chain state together
+        previous_hash = self.chain[-1]
+        signing_payload = f"{event_id}{payload_hash}{timestamp}{previous_hash}".encode('utf-8')
+        
+        # 5. Generate the raw Ed25519 signature
+        signature = private_key.sign(signing_payload)
+        
+        # 6. Mint the immutable structured token
+        token = TransactionToken(
+            event_id=event_id,
+            payload_hash=payload_hash,
+            timestamp=timestamp,
+            public_key_bytes=public_key_bytes,
+            signature=signature
+        )
+        
+        # 7. Generate the new top-level State History Hash (H_n) from the full token context
+        token_bytes = f"{token.event_id}{token.payload_hash}{token.timestamp}".encode('utf-8')
+        hash_input = previous_hash.encode('utf-8') + token_bytes + token.public_key_bytes + token.signature
+        new_state_hash = hashlib.sha256(hash_input).hexdigest()
+        
+        # 8. Commit permanently to the internal memory matrix
+        self.chain.append(new_state_hash)
+        self.token_ledger.append(token)
+        
+        return new_state_hash
+
+    def verify_ledger_integrity(self) -> bool:
+        """
+        Audits the entire execution history from the Genesis block forward.
+        Verifies both linear chain continuity and individual cryptographic signatures.
+        """
+        current_hash = self.genesis_hash
+        
+        for i, token in enumerate(self.token_ledger):
+            # A. Reconstruct the message that was supposed to be signed
+            signing_payload = f"{token.event_id}{token.payload_hash}{token.timestamp}{current_hash}".encode('utf-8')
+            
+            # B. Reconstruct the Public Key object from the token's embedded identity
+            try:
+                public_key = ed25519.Ed25519PublicKey.from_public_bytes_raw(token.public_key_bytes)
+                # C. Cryptographically verify the Ed25519 signature
+                public_key.verify(token.signature, signing_payload)
+            except InvalidSignature:
+                print(f"CRITICAL ACCOUNTABILITY ALERT: Cryptographic forgery detected at block index {i}!")
+                return False
+            except Exception as e:
+                print(f"Systemic validation exception at block {i}: {str(e)}")
+                return False
+            
+            # D. Re-compute the expected state history hash (H_n)
+            token_bytes = f"{token.event_id}{token.payload_hash}{token.timestamp}".encode('utf-8')
+            hash_input = current_hash.encode('utf-8') + token_bytes + token.public_key_bytes + token.signature
+            recalculated_hash = hashlib.sha256(hash_input).hexdigest()
+            
+            # E. Confirm match against the recorded state track
+            if recalculated_hash != self.chain[i + 1]:
+                print(f"CRITICAL ACCOUNTABILITY ALERT: Hash chain continuity broken at block index {i}!")
+                return False
+                
+            current_hash = recalculated_hash
+            
+        return True
+
+# --- Verification Deployment Script ---
+if __name__ == "__main__":
+    # Generate mock keys representing distinct constitutional actors
+    oversight_priv_key = ed25519.Ed25519PrivateKey.generate()
+    kernel_guard_priv_key = ed25519.Ed25519PrivateKey.generate()
+    
+    # Initialize the engine
+    engine = CryptographicHistoryEngine()
+    print(f"Genesis Anchor Initialized: {engine.genesis_hash}\n")
+
+    # Step 1: Tokenize an action signed by the Oversight Officer
+    payload_1 = {"target_system": "COMMUNICATIONS_ROUTER_A", "action": "WARRANT_CHECK", "status": "APPROVED"}
+    hash_1 = engine.tokenize_and_append("INCOMING_REQ", payload_1, oversight_priv_key)
+    print(f"Transaction 1 Signed & Processed. Hash -> {hash_1}")
+
+    # Step 2: Tokenize a subsequent action signed by the Automated Kernel Guard
+    payload_2 = {"data_blocks_accessed":, "stream_throughput_mbps": 850.5}
+    hash_2 = engine.tokenize_and_append("DATA_STREAMING", payload_2, kernel_guard_priv_key)
+    print(f"Transaction 2 Signed & Processed. Hash -> {hash_2}")
+
+    # Step 3: Run comprehensive system audit (Expected: TRUE)
+    is_secure = engine.verify_ledger_integrity()
+    print(f"\nSystem Cryptographic Integrity Audit: {'PASSED' if is_secure else 'FAILED'}")
+
+    # --- SIMULATING MALICIOUS ATTEMPT (MITM/SIGNATURE MANIPULATION) ---
+    print("\n[!] Simulating internal bad-actor breach (Attempting injection attack)...")
+    
+    # A rogue asset attempts to swap out Transaction 2's payload, keeping the rest identical
+    malicious_payload = {"data_blocks_accessed":, "stream_throughput_mbps": 0.0}
+    bad_payload_serialized = json.dumps(malicious_payload, sort_keys=True).encode('utf-8')
+    bad_payload_hash = hashlib.sha256(bad_payload_serialized).hexdigest()
+    
+    # Modify the ledger entry directly in memory to force-inject the bad hash
+    target_token = engine.token_ledger[1]
+    tampered_token = TransactionToken(
+        event_id=target_token.event_id,
+        payload_hash=bad_payload_hash,  # Injected alteration
+        timestamp=target_token.timestamp,
+        public_key_bytes=target_token.public_key_bytes,
+        signature=target_token.signature # Reusing original signature
+    )
+    engine.token_ledger[1] = tampered_token
+
+    # Step 4: Run audit after injection attempt (Expected: IMMEDIATE FAILURE)
+    is_secure_post_breach = engine.verify_ledger_integrity()
+    print(f"Post-Breach Cryptographic Integrity Audit: {'PASSED' if is_secure_post_breach else 'FAIL_SYSTEM_LOCKED'}")
+
 export AUDIT_SECRET="federal-oversight-secure-key-2026"
 python oversight_crawler_ledger.py crawl \
     --seed https://example.gov/oversight-home \
