@@ -1,4 +1,4 @@
-"""
+push"""
 System Architecture: The Omnipresent Post-Quantum Sovereign Operating Matrix
 Core Principles: Absolute Natural Living Rights, Silicon-Hardened Nonce Isolation, Asymmetric MPC Invariants
 """
